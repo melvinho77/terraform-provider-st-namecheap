@@ -32,13 +32,14 @@ type namecheapDomainResource struct {
 }
 
 type namecheapDomainState struct {
-	Domain           types.String  `tfsdk:"domain"`
-	Nameservers      types.List    `tfsdk:"nameservers"`
-	MaxPrice         types.Float64 `tfsdk:"max_price"`
-	MinDaysRemaining types.Int64   `tfsdk:"min_days_remaining"`
-	Years            types.Int64   `tfsdk:"purchase_years"`
-	DomainExpiryDate types.String  `tfsdk:"domain_expiry_date"`
-	RequiredRenew    types.Bool    `tfsdk:"required_renew"`
+	Domain             types.String  `tfsdk:"domain"`
+	Nameservers        types.List    `tfsdk:"nameservers"`
+	MaxPrice           types.Float64 `tfsdk:"max_price"`
+	MinDaysRemaining   types.Int64   `tfsdk:"min_days_remaining"`
+	Years              types.Int64   `tfsdk:"purchase_years"`
+	DomainExpiryDate   types.String  `tfsdk:"domain_expiry_date"`
+	RequiredRenew      types.Bool    `tfsdk:"required_renew"`
+	RequiredReactivate types.Bool    `tfsdk:"required_reactivate"`
 }
 
 func NewNamecheapDomainResource() resource.Resource {
@@ -87,6 +88,10 @@ func (r *namecheapDomainResource) Schema(_ context.Context, _ resource.SchemaReq
 			},
 			"required_renew": &schema.BoolAttribute{
 				MarkdownDescription: "A boolean flag to keep track of whether domain renewal action is required. ",
+				Computed:            true,
+			},
+			"required_reactivate": &schema.BoolAttribute{
+				MarkdownDescription: "A boolean flag to keep track of whether domain reactivate action is required. ",
 				Computed:            true,
 			},
 		},
@@ -158,6 +163,7 @@ func (r *namecheapDomainResource) Create(ctx context.Context, req resource.Creat
 	}
 	state.DomainExpiryDate = types.StringValue(domainExpiryDate.Format("2006-01-02T15:04:05Z"))
 	state.RequiredRenew = types.BoolValue(false)
+	// state.RequiredReactivate = types.BoolValue(false)
 
 	d2 := resp.State.Set(ctx, &state)
 	resp.Diagnostics.Append(d2...)
@@ -253,12 +259,14 @@ func (r *namecheapDomainResource) Update(ctx context.Context, req resource.Updat
 			if resp.Diagnostics.HasError() {
 				return
 			}
+
 		case MODE_REACTIVATE:
 			diag := r.reactivateDomain(ctx, domain, strconv.FormatInt(renewYear, 10))
 			resp.Diagnostics.Append(diag)
 			if resp.Diagnostics.HasError() {
 				return
 			}
+
 		default:
 			resp.Diagnostics.AddError("Invalid mode value", newMode)
 			return
@@ -272,9 +280,10 @@ func (r *namecheapDomainResource) Update(ctx context.Context, req resource.Updat
 		}
 	}
 
-	// Update and refresh state for attributes `domainExpiryDate` & `domainExpirationDays`
+	// Update and refresh state for attributes `domainExpiryDate`, `requiredRenew`, `requiredReactivate`
 	state.DomainExpiryDate = types.StringValue(domainExpiryDate.Format("2006-01-02T15:04:05Z"))
 	state.RequiredRenew = types.BoolValue(false)
+	state.RequiredReactivate = types.BoolValue(false)
 
 	// Configure nameservers
 	var nameservers []string
@@ -332,21 +341,45 @@ func (r *namecheapDomainResource) ModifyPlan(ctx context.Context, req resource.M
 	diags := req.Plan.Get(ctx, &plan)
 	resp.Diagnostics.Append(diags...)
 
-	requiresRenew, err := isDomainRequiredRenew(plan.MinDaysRemaining.ValueInt64(), plan.DomainExpiryDate.ValueString())
-	if err != nil {
+	// Because some domains do not have `domainExpiryDate` stored due to
+	// them being created by previous versions of provider in which it did not have
+	// the attribute `domainExpiryDate`, this causes when we run `terraform plan`,
+	// it will retrieve empty values and ultimately unable to reactivate / renew the domain.
+
+	// Therefore, we will do a simple `if...else` checking to make sure that `terraform plan`
+	// has the parameters we need to verify whether domain needs renew / reactivate.
+	if plan.DomainExpiryDate.ValueString() == "" {
+		domainExpiryDate, err := r.getDomainExpiryDate(plan.Domain.ValueString())
+		if err != nil {
+			resp.Diagnostics.Append(err)
+			return
+		}
+		plan.DomainExpiryDate = types.StringValue(domainExpiryDate.Format("2006-01-02T15:04:05Z"))
+	}
+
+	requiresRenew, requiresReactivate, _err := checkDomainExpiry(plan.MinDaysRemaining.ValueInt64(), plan.DomainExpiryDate.ValueString())
+	if _err != nil {
 		return
 	}
 
-	// Enforce update lifecycle if domain is required to renew
-	if requiresRenew {
+	if requiresRenew || requiresReactivate {
 		plan.DomainExpiryDate = types.StringUnknown()
-		plan.RequiredRenew = types.BoolUnknown()
+		resp.Diagnostics.Append(
+			resp.Plan.SetAttribute(ctx, path.Root("domain_expiry_date"), types.StringUnknown())...,
+		)
 
-		setDomainExpiryDate := resp.Plan.SetAttribute(ctx, path.Root("domain_expiry_date"), types.StringUnknown())
-		setRequiredRenew := resp.Plan.SetAttribute(ctx, path.Root("required_renew"), types.BoolUnknown())
-
-		resp.Diagnostics.Append(setDomainExpiryDate...)
-		resp.Diagnostics.Append(setRequiredRenew...)
+		if requiresRenew {
+			plan.RequiredRenew = types.BoolUnknown()
+			resp.Diagnostics.Append(
+				resp.Plan.SetAttribute(ctx, path.Root("required_renew"), types.BoolUnknown())...,
+			)
+		}
+		if requiresReactivate {
+			plan.RequiredReactivate = types.BoolUnknown()
+			resp.Diagnostics.Append(
+				resp.Plan.SetAttribute(ctx, path.Root("required_reactivate"), types.BoolUnknown())...,
+			)
+		}
 	}
 
 	if resp.Diagnostics.HasError() {
@@ -522,16 +555,27 @@ func calcDomainRemainingDays(expiryDate time.Time) int64 {
 	return int64(expiryDate.Sub(todayDate).Hours() / 24)
 }
 
-// Function to determine when the domain requires renewal action
-func isDomainRequiredRenew(minDaysremaining int64, domainExpiry string) (bool, error) {
+// Function to determine whether the domain requires renewal / reactivate
+// Returns 2 bool values which are [is renew required] and [is reactivate required]
+func checkDomainExpiry(minDaysRemaining int64, domainExpiry string) (bool, bool, error) {
 	domainExpiryDate, err := time.Parse("2006-01-02T15:04:05Z", domainExpiry)
 	if err != nil {
-		return false, err
+		return false, false, err
 	}
 
 	domainRemainingDays := calcDomainRemainingDays(domainExpiryDate)
 
-	return (domainRemainingDays <= minDaysremaining), err
+	// Check to determine whether reactivate is needed
+	if domainRemainingDays <= 0 {
+		return false, true, nil
+	}
+
+	// Check to determine whether renew is needed
+	if domainRemainingDays <= minDaysRemaining && domainRemainingDays >= 1 {
+		return true, false, nil
+	}
+
+	return false, false, nil
 }
 
 func log(ctx context.Context, format string, a ...any) {
